@@ -67,6 +67,7 @@ set(cfnetwork_sources
 	HTTP/CFHTTPAuthentication.c
 	HTTP/CFHTTPConnection.c
 	CFNetServices.c # requires Bonjour
+	XcodeLazySymbols.c
 	Host/CFHost.c
 	Proxies/ProxySupport.c
 	Cookies/CFHTTPCookie.c
