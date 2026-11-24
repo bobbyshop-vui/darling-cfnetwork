@@ -21,6 +21,13 @@
 #include "CFRuntime.h"
 #include <zlib.h>
 #include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include "CFHTTPCookieStorage.h"
 #include "CFRuntimeUtils.h"
 
@@ -316,7 +323,118 @@ static Boolean noopCredentialStorage(const void *info) {
     return true;
 }
 
+static void connectionGotResponse(struct _CFURLConnection *connection, CFURLResponseRef response);
+static void connectionGotData(struct _CFURLConnection *connection, CFDataRef data);
+static void connectionFinished(struct _CFURLConnection *connection);
+static void connectionFailed(struct _CFURLConnection *connection, CFErrorRef error);
+
+static Boolean requestIsFileURL(CFURLRequestRef request) {
+    CFURLRef url = request ? CFURLRequestGetURL(request) : NULL;
+    if (url == NULL) {
+        return false;
+    }
+    CFStringRef scheme = CFURLCopyScheme(url);
+    Boolean result = scheme != NULL && CFStringCompare(scheme, CFSTR("file"), kCFCompareCaseInsensitive) == kCFCompareEqualTo;
+    if (scheme != NULL) {
+        CFRelease(scheme);
+    }
+    return result;
+}
+
+static CFStringRef copyMIMETypeForPathExtension(CFStringRef ext) {
+    static const struct { const char *ext; const char *mime; } types[] = {
+        { "txt", "text/plain" }, { "html", "text/html" }, { "htm", "text/html" },
+        { "css", "text/css" }, { "xml", "text/xml" }, { "js", "application/javascript" },
+        { "json", "application/json" }, { "plist", "application/x-plist" },
+        { "png", "image/png" }, { "jpg", "image/jpeg" }, { "jpeg", "image/jpeg" },
+        { "gif", "image/gif" }, { "tiff", "image/tiff" }, { "tif", "image/tiff" },
+        { "pdf", "application/pdf" }, { "zip", "application/zip" },
+        { "gz", "application/x-gzip" }, { "svg", "image/svg+xml" },
+    };
+    if (ext != NULL) {
+        char buffer[16];
+        if (CFStringGetCString(ext, buffer, sizeof(buffer), kCFStringEncodingUTF8)) {
+            for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+                if (strcasecmp(buffer, types[i].ext) == 0) {
+                    return CFStringCreateWithCString(kCFAllocatorDefault, types[i].mime, kCFStringEncodingUTF8);
+                }
+            }
+        }
+    }
+    return CFStringCreateWithCString(kCFAllocatorDefault, "application/octet-stream", kCFStringEncodingUTF8);
+}
+
+static void failFileConnection(struct _CFURLConnection *connection, CFIndex code) {
+    CFErrorRef error = CFErrorCreate(kCFAllocatorDefault, ErrorDomain, code, NULL);
+    connectionFailed(connection, error);
+    CFRelease(error);
+}
+
+// file: URLs never touch the HTTP stack: read the file from disk and report it the way
+// Apple's file protocol does (response with MIME type and expected length, then the data).
+static void openFileConnection(struct _CFURLConnection *connection) {
+    connection->streamValid = true;
+    connection->valid = true;
+    connection->lastScheduleTime = CFAbsoluteTimeGetCurrent();
+
+    CFURLRef url = CFURLRequestGetURL(connection->request);
+    char path[PATH_MAX];
+    if (!CFURLGetFileSystemRepresentation(url, true, (UInt8 *)path, sizeof(path))) {
+        failFileConnection(connection, kCFURLErrorBadURL);
+        return;
+    }
+
+    struct stat st;
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0 && fstat(fd, &st) != 0) {
+        close(fd);
+        fd = -1;
+        errno = ENOENT;
+    }
+    if (fd < 0) {
+        failFileConnection(connection, (errno == EACCES || errno == EPERM) ? kCFURLErrorNoPermissionsToReadFile : kCFURLErrorFileDoesNotExist);
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        close(fd);
+        failFileConnection(connection, kCFURLErrorFileIsDirectory);
+        return;
+    }
+
+    CFStringRef ext = CFURLCopyPathExtension(url);
+    CFStringRef mime = copyMIMETypeForPathExtension(ext);
+    if (ext != NULL) {
+        CFRelease(ext);
+    }
+    CFURLResponseRef response = CFURLResponseCreate(kCFAllocatorDefault, url, mime, (int64_t)st.st_size, NULL);
+    CFRelease(mime);
+    connectionGotResponse(connection, response);
+    CFRelease(response);
+
+    CFMutableDataRef contents = CFDataCreateMutable(kCFAllocatorDefault, 0);
+    UInt8 buffer[16384];
+    ssize_t n;
+    while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
+        CFDataAppendBytes(contents, buffer, n);
+    }
+    close(fd);
+    if (n < 0) {
+        CFRelease(contents);
+        failFileConnection(connection, kCFURLErrorNoPermissionsToReadFile);
+        return;
+    }
+    if (CFDataGetLength(contents) > 0) {
+        connectionGotData(connection, contents);
+    }
+    CFRelease(contents);
+    connectionFinished(connection);
+}
+
 static void openConnection(struct _CFURLConnection * connection) {
+    if (requestIsFileURL(connection->request)) {
+        openFileConnection(connection);
+        return;
+    }
     if (replayCached(connection)) {
         return;
     }
@@ -745,31 +863,36 @@ CFURLConnectionRef CFURLConnectionCreate(CFAllocatorRef allocator, CFURLRequestR
     if (connection->createdTime <= 0) {
         connection->createdTime = CFURLREQUEST_MIN_TIMEOUT;
     }
-    connection->message = CFHTTPMessageCreateRequestFromURLRequest(kCFAllocatorDefault, request);
-    if (connection->message) {
-        connection->stream = CFReadStreamCreateForHTTPRequest(kCFAllocatorDefault, connection->message);
-    }
-    else {
-        connection->stream = NULL;
-    }
+    connection->message = NULL;
+    connection->stream = NULL;
+    if (!requestIsFileURL(request)) {
+        connection->message = CFHTTPMessageCreateRequestFromURLRequest(kCFAllocatorDefault, request);
+        if (connection->message) {
+            connection->stream = CFReadStreamCreateForHTTPRequest(kCFAllocatorDefault, connection->message);
+        }
+        else {
+            connection->stream = NULL;
+        }
 
-    if (connection->message) {
-        CFRelease(connection->message);
+        if (connection->message) {
+            CFRelease(connection->message);
+        }
+        CFOptionFlags flags = kCFStreamEventOpenCompleted |
+        kCFStreamEventHasBytesAvailable |
+        kCFStreamEventErrorOccurred |
+        kCFStreamEventEndEncountered;
+
+        setProxy(connection->stream);
+
+        CFStreamClientContext clientContext = {
+            .version = 0,
+            .info = (void *)connection,
+            .retain = (void *(*)(void *))&noopRetain,
+            .release = (void (*)(void *))&noopRelease
+        };
+        CFReadStreamSetClient(connection->stream, flags, readStreamEvent, &clientContext);
+
     }
-    CFOptionFlags flags = kCFStreamEventOpenCompleted |
-    kCFStreamEventHasBytesAvailable |
-    kCFStreamEventErrorOccurred |
-    kCFStreamEventEndEncountered;
-
-    setProxy(connection->stream);
-
-    CFStreamClientContext clientContext = {
-        .version = 0,
-        .info = (void *)connection,
-        .retain = (void *(*)(void *))&noopRetain,
-        .release = (void (*)(void *))&noopRelease
-    };
-    CFReadStreamSetClient(connection->stream, flags, readStreamEvent, &clientContext);
 
     connection->zStream = malloc(sizeof(z_stream));
     connection->zStream->zalloc = Z_NULL;
@@ -985,8 +1108,10 @@ static void updateQueue(void *ctx) {
     for (int i = 0; i < NUM_QUEUES; i++) {
         struct _CFURLConnection *connection = (struct _CFURLConnection *)activeConnections[i];
         if (connection != NULL && !connection->streamValid) {
-            CFReadStreamClose(connection->stream);
-            CFReadStreamUnscheduleFromRunLoop(connection->stream, runLoop, kCFRunLoopCommonModes);
+            if (connection->stream) {
+                CFReadStreamClose(connection->stream);
+                CFReadStreamUnscheduleFromRunLoop(connection->stream, runLoop, kCFRunLoopCommonModes);
+            }
             if (connection->replacementStream) {
                 CFRelease(connection->stream);
                 connection->stream = connection->replacementStream;
@@ -1487,7 +1612,7 @@ static Boolean replayCached(struct _CFURLConnection *connection) {
 
 static ContentEncoding parseContentEncoding(CFURLResponseRef response) {
     CFDictionaryRef headerFields = CFURLResponseGetHeaderFields(response);
-    CFStringRef value = (CFStringRef)CFDictionaryGetValue(headerFields, CFSTR("Content-Encoding"));
+    CFStringRef value = headerFields ? (CFStringRef)CFDictionaryGetValue(headerFields, CFSTR("Content-Encoding")) : NULL;
 
     if (!value) {
         return kContentEncodingNone;

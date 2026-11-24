@@ -10,6 +10,11 @@
 #import <Foundation/NSData.h>
 #import <Foundation/NSOperation.h>
 
+@interface NSURLSessionTask (XcodeSessionPrivate)
+- (id)initWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler;
+- (void)_setSession:(NSURLSession *)session;
+@end
+
 @implementation __NSCFURLSessionConfiguration
 @end
 
@@ -348,6 +353,7 @@
     NSMutableURLRequest *uploadRequest = [request mutableCopy];
     [uploadRequest setHTTPBody:bodyData];
     NSURLSessionUploadTask *task = [[NSURLSessionUploadTask alloc] initWithRequest:uploadRequest completionHandler:completionHandler];
+    [task _setSession:(NSURLSession *)self];
     [uploadRequest release];
     return [task autorelease];
 }
@@ -364,7 +370,9 @@
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler
 {
-    return [[[NSURLSessionDataTask alloc] initWithRequest:request completionHandler:completionHandler] autorelease];
+    NSURLSessionDataTask *task = [[NSURLSessionDataTask alloc] initWithRequest:request completionHandler:completionHandler];
+    [task _setSession:(NSURLSession *)self];
+    return [task autorelease];
 }
 
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url
@@ -374,9 +382,7 @@
 
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler
 {
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    [request setHTTPMethod:@"POST"];
-    return [self dataTaskWithRequest:request completionHandler:completionHandler];
+    return [self dataTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:completionHandler];
 }
 
 - (NSURLSessionDataTask *)dataTaskWithHTTPGetRequest:(NSURL *)url
